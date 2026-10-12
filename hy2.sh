@@ -3,7 +3,7 @@
 # 一键安装 Hysteria2 服务端 (手搓版)
 #
 # 用法:
-#   bash hy2.sh                          # 默认 UDP 443 端口,随机密码
+#   bash hy2.sh                          # 默认 10000~65535 随机 UDP 端口,随机密码
 #   HY2_PORT=8443 bash hy2.sh            # 自定义端口
 #   HY2_PASSWORD=xxxxxx bash hy2.sh      # 自定义密码
 #
@@ -12,10 +12,18 @@
 set -e
 
 # ---------------- 配置 ----------------
-HY2_PORT="${HY2_PORT:-443}"
 CONFIG_DIR="/etc/hysteria"
 BIN="/usr/local/bin/hysteria"
 SNI_DOMAIN="www.bing.com"
+
+# 端口:没指定就 10000~65535 随机
+if [ -z "$HY2_PORT" ]; then
+  if command -v shuf >/dev/null 2>&1; then
+    HY2_PORT="$(shuf -i 10000-65535 -n 1)"
+  else
+    HY2_PORT="$(awk 'BEGIN{srand(); print int(10000+rand()*55536)}')"
+  fi
+fi
 
 # ---------------- 必须是 root ----------------
 if [ "$(id -u)" -ne 0 ]; then
