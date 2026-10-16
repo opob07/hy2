@@ -6,6 +6,8 @@
 #   bash hy2.sh                          # 默认 10000~65535 随机 UDP 端口,随机密码
 #   HY2_PORT=8443 bash hy2.sh            # 自定义端口
 #   HY2_PASSWORD=xxxxxx bash hy2.sh      # 自定义密码
+#   HY2_HOP="20000:30000" bash hy2.sh    # 端口跳跃:Surge 在该 UDP 段内轮跳
+#                                        # (需独立 IP,iptables 做段转发;NAT 机不适用)
 #
 # 支持: Debian / Ubuntu / Alpine,systemd / OpenRC
 #
@@ -23,6 +25,25 @@ if [ -z "$HY2_PORT" ]; then
   else
     HY2_PORT="$(awk 'BEGIN{srand(); print int(10000+rand()*55536)}')"
   fi
+fi
+
+# ---------------- 端口跳跃 (可选) ----------------
+# 原理: Surge 在 HOP_START:HOP_END 段内轮跳 UDP 端口;
+#       服务端用 iptables 把整段转发到 HY2_PORT,hysteria 本体只监听一个端口。
+# 注意: NAT 机每个端口都要商家单独映射,不适用;只适合有独立 IP 的机器。
+HOP_START=""
+HOP_END=""
+if [ -n "$HY2_HOP" ]; then
+  _HOP_RANGE="$(echo "$HY2_HOP" | tr '-' ':')"
+  HOP_START="${_HOP_RANGE%%:*}"
+  HOP_END="${_HOP_RANGE##*:}"
+  if ! [[ "$HOP_START" =~ ^[0-9]+$ && "$HOP_END" =~ ^[0-9]+$ ]] \
+     || [ "$HOP_START" -lt 1 ] || [ "$HOP_END" -gt 65535 ] \
+     || [ "$HOP_START" -ge "$HOP_END" ]; then
+    echo "HY2_HOP 格式错误,应为 起始:结束,例如 \"20000:30000\""
+    exit 1
+  fi
+  echo "端口跳跃: UDP ${HOP_START}:${HOP_END} -> ${HY2_PORT}"
 fi
 
 # ---------------- 必须是 root ----------------
@@ -50,6 +71,18 @@ elif command -v yum >/dev/null 2>&1; then
 else
   echo "未知包管理器,请手动装好 curl 和 openssl 再跑"
   exit 1
+fi
+
+# 端口跳跃必须有 iptables
+if [ -n "$HOP_START" ] && ! command -v iptables >/dev/null 2>&1; then
+  echo "==> 安装 iptables (端口跳跃需要)..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get install -y -qq iptables >/dev/null
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache iptables >/dev/null
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y -q iptables >/dev/null
+  fi
 fi
 
 # ---------------- 下载 hysteria2 ----------------
@@ -102,6 +135,58 @@ elif command -v firewall-cmd >/dev/null 2>&1; then
 elif command -v iptables >/dev/null 2>&1; then
   iptables -C INPUT -p udp --dport "${HY2_PORT}" -j ACCEPT 2>/dev/null \
     || iptables -I INPUT -p udp --dport "${HY2_PORT}" -j ACCEPT 2>/dev/null || true
+fi
+
+# ---------------- 端口跳跃:防火墙段转发 ----------------
+if [ -n "$HOP_START" ]; then
+  echo "==> 配置端口跳跃转发 (UDP ${HOP_START}:${HOP_END} -> ${HY2_PORT})..."
+  # 生成幂等的转发脚本:整段 REDIRECT 到主端口 + 放行 INPUT
+  cat > /usr/local/bin/hy2-hop-nat.sh <<EOF
+#!/bin/sh
+# Hysteria2 端口跳跃转发规则 (幂等,可重复执行)
+iptables -t nat -C PREROUTING -p udp --dport ${HOP_START}:${HOP_END} -j REDIRECT --to-port ${HY2_PORT} 2>/dev/null \
+  || iptables -t nat -A PREROUTING -p udp --dport ${HOP_START}:${HOP_END} -j REDIRECT --to-port ${HY2_PORT} 2>/dev/null || true
+iptables -C INPUT -p udp --dport ${HOP_START}:${HOP_END} -j ACCEPT 2>/dev/null \
+  || iptables -I INPUT -p udp --dport ${HOP_START}:${HOP_END} -j ACCEPT 2>/dev/null || true
+EOF
+  chmod +x /usr/local/bin/hy2-hop-nat.sh
+  if /usr/local/bin/hy2-hop-nat.sh 2>/dev/null; then
+    echo "转发规则已生效"
+  else
+    echo "警告: iptables NAT 规则写入失败(容器/受限内核常见),端口跳跃可能不工作"
+    echo "请手动执行 /usr/local/bin/hy2-hop-nat.sh 查看报错"
+  fi
+  # 开机持久化
+  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    cat > /etc/systemd/system/hysteria-hop-nat.service <<EOF
+[Unit]
+Description=Hysteria2 port hopping NAT rules
+After=network.target
+Before=hysteria-server.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/hy2-hop-nat.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable hysteria-hop-nat >/dev/null 2>&1 || true
+    echo "已注册开机任务: hysteria-hop-nat.service"
+  elif command -v rc-service >/dev/null 2>&1; then
+    mkdir -p /etc/local.d
+    cat > /etc/local.d/hy2-hop-nat.start <<'RCEOF'
+#!/bin/sh
+/usr/local/bin/hy2-hop-nat.sh
+RCEOF
+    chmod +x /etc/local.d/hy2-hop-nat.start
+    rc-update add local default >/dev/null 2>&1 || true
+    echo "已注册开机任务: /etc/local.d/hy2-hop-nat.start"
+  else
+    echo "未识别 init 系统,重启后请手动执行 /usr/local/bin/hy2-hop-nat.sh 恢复转发"
+  fi
 fi
 
 # ---------------- BBR ----------------
@@ -171,12 +256,25 @@ echo "=============================================="
 echo "端口:  ${HY2_PORT} (UDP)"
 echo "密码:  ${HY2_PASSWORD}"
 echo "SNI:   ${SNI_DOMAIN}"
+if [ -n "$HOP_START" ]; then
+  echo "跳跃段: ${HOP_START}:${HOP_END} (UDP) -> ${HY2_PORT}"
+fi
 echo ""
 echo "--- 通用链接 (v2rayN / Nekoray / Streisand 可导入) ---"
 echo "hysteria2://${HY2_PASSWORD}@${SERVER_IP}:${HY2_PORT}?sni=${SNI_DOMAIN}&insecure=1#HY2-${HY2_PORT}"
+if [ -n "$HOP_START" ]; then
+  echo "(注: 通用链接不带端口跳跃,其他客户端请按各客户端格式自行加跳跃段)"
+fi
 echo ""
 echo "--- Surge 配置 (加到 [Proxy] 段) ---"
-echo "HY2-${HY2_PORT} = hysteria2, ${SERVER_IP}, ${HY2_PORT}, password=${HY2_PASSWORD}, sni=${SNI_DOMAIN}, skip-cert-verify=true"
+SURGE_LINE="HY2-${HY2_PORT} = hysteria2, ${SERVER_IP}, ${HY2_PORT}, password=${HY2_PASSWORD}, sni=${SNI_DOMAIN}, skip-cert-verify=true"
+if [ -n "$HOP_START" ]; then
+  SURGE_LINE="${SURGE_LINE}, port-hopping=\"${HOP_START}-${HOP_END}\", port-hopping-interval=30"
+fi
+echo "$SURGE_LINE"
+if [ -n "$HOP_START" ]; then
+  echo "(注: 开启端口跳跃后 Surge 会忽略行首主端口,在 ${HOP_START}-${HOP_END} 内每 30 秒轮跳)"
+fi
 echo ""
 echo "--- 常用命令 ---"
 echo "systemd: systemctl status|restart hysteria-server"
